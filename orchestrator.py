@@ -62,6 +62,7 @@ FORWARDED_WS_TYPES = {
     "execution_interrupted",
     "notification",
 }
+DIRECT_HISTORY_PATH = re.compile(r"^/(?:api/)?history(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
 DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
@@ -703,6 +704,10 @@ class MultiGpuOrchestrator:
         self._started = False
         self._closing = False
         self._start_lock = asyncio.Lock()
+        self._history_lock = asyncio.Lock()
+        self._pending_history: dict[str, WorkerState] = {}
+        self._history_sync_task: asyncio.Task | None = None
+        self._deleted_history_ids: set[str] = set()
         self._comfy_args: Any = None
         self.log_session_id = str(time.time_ns())
         self.config = load_config()
@@ -762,6 +767,11 @@ class MultiGpuOrchestrator:
         if self._closing:
             return
         self._closing = True
+        if self._history_sync_task is not None:
+            self._history_sync_task.cancel()
+            await asyncio.gather(self._history_sync_task, return_exceptions=True)
+            self._history_sync_task = None
+        self._pending_history.clear()
         for worker in self.workers:
             for task in worker.client_bridge_tasks.values():
                 task.cancel()
@@ -804,6 +814,11 @@ class MultiGpuOrchestrator:
         worker.client_bridge_ready.clear()
         worker.accepted_prompt_ids.clear()
         worker.pending_prompt_payloads.clear()
+        self._pending_history = {
+            prompt_id: mapped_worker
+            for prompt_id, mapped_worker in self._pending_history.items()
+            if mapped_worker is not worker
+        }
         self.prompt_to_worker = {
             prompt_id: mapped_worker
             for prompt_id, mapped_worker in self.prompt_to_worker.items()
@@ -1258,6 +1273,11 @@ class MultiGpuOrchestrator:
             prompt_id = str(prompt_id)
             worker.accepted_prompt_ids.add(prompt_id)
             self.prompt_to_worker[prompt_id] = worker
+            self._deleted_history_ids.discard(prompt_id)
+            self._pending_history[prompt_id] = worker
+            if getattr(self.prompt_server, "prompt_queue", None) is not None and not self._closing:
+                if self._history_sync_task is None or self._history_sync_task.done():
+                    self._history_sync_task = asyncio.create_task(self._sync_pending_history())
             submitted_payload = prompt_payload if isinstance(prompt_payload, dict) and "prompt" in prompt_payload else None
             if submitted_payload is not None:
                 worker.pending_prompt_payloads[prompt_id] = copy.deepcopy(submitted_payload)
@@ -1500,6 +1520,11 @@ class MultiGpuOrchestrator:
         if message_type == "execution_start":
             worker.running = max(worker.running, 1)
             worker.last_seen = time.time()
+        if message_type == "executing" and isinstance(data, dict) and data.get("node") is None:
+            # ComfyUI emits this after task_done; publish history before notifying clients.
+            prompt_id = data.get("prompt_id")
+            if prompt_id:
+                await self.sync_history(str(prompt_id))
         await self.prompt_server.send(message_type, data, client_id)
         if message_type == "execution_success":
             self._forget_worker_prompt(worker, data)
@@ -1935,26 +1960,121 @@ class MultiGpuOrchestrator:
         status = 200 if any(item["ok"] for item in result) else 424
         return web.json_response({"workers": result}, status=status)
 
-    async def proxy_history(self, request: Any) -> Any:
-        if not self._started:
-            return web.json_response({"error": "workers are not started"}, status=424)
-        prompt_id = request.match_info.get("prompt_id")
-        route = f"/history/{prompt_id}" if prompt_id else "/history"
-        payloads = await self._fetch_worker_payloads(route, query_to_dict(request.rel_url.query))
-        history: dict[str, Any] = {}
-        for payload in payloads:
-            if isinstance(payload, dict):
-                history.update(payload)
-        return web.json_response(history)
+    def _merge_parent_history(self, history: dict[str, Any]) -> None:
+        queue = self.prompt_server.prompt_queue
+        try:
+            from execution import MAXIMUM_HISTORY_SIZE
+        except ImportError:
+            MAXIMUM_HISTORY_SIZE = 10000
+        # The primary execution thread also writes to this queue. Never replace it.
+        added_outputs = False
+        with queue.mutex:
+            for prompt_id, entry in history.items():
+                if prompt_id in self._deleted_history_ids or not isinstance(entry, dict):
+                    continue
+                if prompt_id not in queue.history:
+                    queue.history[prompt_id] = copy.deepcopy(entry)
+                    added_outputs = added_outputs or bool(entry.get("outputs"))
+                self._pending_history.pop(prompt_id, None)
+            while len(queue.history) > MAXIMUM_HISTORY_SIZE:
+                retired_id = next(iter(queue.history))
+                queue.history.pop(retired_id)
+                self._deleted_history_ids.add(retired_id)
+        if added_outputs:
+            self._start_primary_asset_seed()
 
-    async def proxy_history_control(self, request: Any) -> Any:
-        await self.start()
-        payload = await _read_json_or_empty(request)
-        if not self.workers:
-            return web.json_response({"workers": [], "error": "no workers available"}, status=424)
-        result = await self._fanout_post(self.workers, "/history", payload)
-        status = 200 if any(item["ok"] for item in result) else 424
-        return web.json_response({"workers": result}, status=status)
+    async def _worker_history(self, worker: WorkerState, prompt_id: str | None = None) -> dict[str, Any]:
+        route = f"/history/{quote(prompt_id, safe='')}" if prompt_id is not None else "/history"
+        # History polling must not hang the main API or change worker health.
+        payload = await asyncio.wait_for(self._fetch_worker_json(worker, route), timeout=5)
+        return payload if isinstance(payload, dict) else {}
+
+    async def sync_history(self, prompt_id: str | None = None) -> None:
+        if getattr(self.prompt_server, "prompt_queue", None) is None:
+            return
+        async with self._history_lock:
+            if prompt_id is not None:
+                if prompt_id in self._deleted_history_ids or self.prompt_server.prompt_queue.get_history(prompt_id):
+                    return
+            owner = self.prompt_to_worker.get(prompt_id) if prompt_id is not None else None
+            workers = [owner] if owner is not None else self.workers
+            for worker in workers:
+                if worker.status in {"failed", "stopped"}:
+                    continue
+                try:
+                    self._merge_parent_history(await self._worker_history(worker, prompt_id))
+                except Exception:
+                    logging.debug("%s Worker history synchronization deferred", LOG_PREFIX, exc_info=True)
+
+    async def _sync_pending_history(self) -> None:
+        # API callers may omit client_id and never open a WebSocket. Import their
+        # results independently of browser connections, retaining them on restart.
+        while self._pending_history and not self._closing:
+            for worker in list(self.workers):
+                async with self._history_lock:
+                    pending = {pid for pid, owner in self._pending_history.items() if owner is worker}
+                    if not pending:
+                        continue
+                    if worker.status in {"failed", "stopped"}:
+                        for pid in pending:
+                            self._pending_history.pop(pid, None)
+                        continue
+                    try:
+                        # Read queue first: a job absent from this snapshot has
+                        # already entered history or was deleted without execution.
+                        queue = await asyncio.wait_for(self._fetch_worker_json(worker, "/queue"), timeout=5)
+                        active = self._queue_prompt_ids(queue)
+                        if active is None:
+                            continue
+                        finished = pending - active
+                        if not finished:
+                            continue
+                        prompt_id = next(iter(finished)) if len(finished) == 1 else None
+                        self._merge_parent_history(await self._worker_history(worker, prompt_id))
+                        for pid in finished:
+                            self._pending_history.pop(pid, None)
+                    except Exception:
+                        logging.debug("%s Pending history synchronization deferred", LOG_PREFIX, exc_info=True)
+            if self._pending_history:
+                await asyncio.sleep(1)
+
+    async def proxy_history(self, request: Any, native_handler: Any = None) -> Any:
+        prompt_id = request.match_info.get("prompt_id")
+        await self.sync_history(prompt_id)
+        if native_handler is not None:
+            # Keep ComfyUI's serialization, pagination, and native fallback records.
+            return await native_handler(request)
+        query = request.rel_url.query
+        max_items = int(query["max_items"]) if "max_items" in query else None
+        offset = int(query["offset"]) if "offset" in query else -1
+        return web.json_response(self.prompt_server.prompt_queue.get_history(
+            prompt_id=prompt_id, max_items=max_items, offset=offset,
+        ))
+
+    async def proxy_history_control(self, request: Any, native_handler: Any = None) -> Any:
+        payload = await request.json()
+        # Capture completed IDs before a clear so an unavailable worker cannot
+        # restore deleted results on its next successful synchronization.
+        if payload.get("clear"):
+            await self.sync_history()
+        async with self._history_lock:
+            queue = self.prompt_server.prompt_queue
+            if payload.get("clear"):
+                self._deleted_history_ids.update(queue.get_history())
+            self._deleted_history_ids.update(payload.get("delete", []))
+            workers = [worker for worker in self.workers if worker.status not in {"failed", "stopped"}]
+            if workers:
+                try:
+                    await asyncio.wait_for(self._fanout_post(workers, "/history", payload), timeout=10)
+                except asyncio.TimeoutError:
+                    logging.warning("%s Worker history control timed out; applying it to primary history", LOG_PREFIX)
+            if native_handler is not None:
+                return await native_handler(request)
+            if payload.get("clear"):
+                queue.wipe_history()
+            for prompt_id in payload.get("delete", []):
+                queue.delete_history_item(prompt_id)
+        return web.Response(status=200)
 
     async def _fanout_post(
         self,
@@ -2106,6 +2226,12 @@ def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) 
     async def route_direct_prompt_request(request: Any, handler: Any) -> Any:
         if request.method == "POST" and request.path in DIRECT_PROMPT_PATHS:
             return await orchestrator.proxy_prompt(request, no_worker_fallback=handler)
+        history_match = DIRECT_HISTORY_PATH.fullmatch(request.path)
+        if history_match is not None:
+            if request.method == "GET":
+                return await orchestrator.proxy_history(request, native_handler=handler)
+            if request.method == "POST" and history_match.group("prompt_id") is None:
+                return await orchestrator.proxy_history_control(request, native_handler=handler)
         cancel_match = DIRECT_JOB_CANCEL_PATH.fullmatch(request.path) if request.method == "POST" else None
         if cancel_match is not None:
             return await orchestrator.proxy_job_cancel(
@@ -2121,10 +2247,10 @@ def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrch
         middleware = create_direct_prompt_routing_middleware(orchestrator)
         prompt_server.app.middlewares.append(middleware)
     except Exception:
-        logging.exception("%s Failed to enable direct prompt and job cancellation API routing", LOG_PREFIX)
+        logging.exception("%s Failed to enable direct prompt, history, and job cancellation API routing", LOG_PREFIX)
         return False
 
-    logging.info("%s Direct prompt and job cancellation API requests will be routed to workers", LOG_PREFIX)
+    logging.info("%s Direct prompt, history, and job cancellation API requests are integrated with workers", LOG_PREFIX)
     return True
 
 

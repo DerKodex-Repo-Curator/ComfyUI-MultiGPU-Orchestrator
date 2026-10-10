@@ -59,3 +59,14 @@ test("worker cancellation failures are returned without falling back to the pare
   assert.equal(await routes.fetchWithFallback(fetch, "/jobs/cancel", "/mgpu/jobs/cancel", { method: "POST" }), response);
   assert.equal(calls.length, 1);
 });
+
+
+test("history uses the parent API without browser rewriting", () => {
+  const routes = loadRoutes("http://localhost:8188");
+  for (const prefix of ["", "/api"]) {
+    for (const route of ["/history", "/history?max_items=1&offset=0", "/history/prompt-id"]) {
+      assert.equal(routes.mappedMgpuRoute(`${prefix}${route}`, "GET"), null);
+    }
+    assert.equal(routes.mappedMgpuRoute(`${prefix}/history`, "POST"), null);
+  }
+});

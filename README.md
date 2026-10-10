@@ -38,6 +38,13 @@ Use the normal queue controls to cancel individual jobs or cancel all jobs.
 Cancellation requires a ComfyUI version that supports the jobs cancellation API.
 If no GPU worker is available, jobs fall back to the main ComfyUI process.
 
+API clients can submit workflows to the main server's standard `POST /prompt`
+endpoint and retrieve worker results through `/history` or `/history/{prompt_id}`.
+Completed results are synchronized into the main process's existing prompt queue,
+including requests without a `client_id` or WebSocket connection. History remains
+available after a worker stops or restarts; clearing or deleting history applies
+to both the main process and workers.
+
 ## Worker Settings
 
 Open the **MultiGPU** sidebar to check worker status and configure:
