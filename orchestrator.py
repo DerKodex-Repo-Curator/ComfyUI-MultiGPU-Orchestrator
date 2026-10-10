@@ -291,6 +291,7 @@ def build_worker_command(
         "--cuda-device",
         str(gpu_index),
         "--disable-auto-launch",
+        "--disable-assets",
     ]
 
     if comfy_args is not None:
@@ -301,8 +302,6 @@ def build_worker_command(
         _optional_path_flag(command, "--user-directory", getattr(comfy_args, "user_directory", None))
         for config_path in getattr(comfy_args, "extra_model_paths_config", []) or []:
             _optional_path_flag(command, "--extra-model-paths-config", config_path)
-        if getattr(comfy_args, "enable_assets", False):
-            command.append("--enable-assets")
 
     extra_flags = os.environ.get("COMFYUI_MGPU_WORKER_FLAGS", "").strip()
     if extra_flags:

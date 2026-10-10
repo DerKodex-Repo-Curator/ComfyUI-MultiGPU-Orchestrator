@@ -92,7 +92,8 @@ class OrchestratorPureTests(unittest.TestCase):
         self.assertIn("/comfy/base", command)
         self.assertIn("--extra-model-paths-config", command)
         self.assertIn("/comfy/extra.yaml", command)
-        self.assertIn("--enable-assets", command)
+        self.assertIn("--disable-assets", command)
+        self.assertNotIn("--enable-assets", command)
 
     def test_worker_log_path_is_stable_per_gpu(self):
         with tempfile.TemporaryDirectory() as tmpdir:
