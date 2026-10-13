@@ -14,7 +14,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from orchestrator import MultiGpuOrchestrator, WorkerState, create_direct_prompt_routing_middleware  # noqa: E402
+from orchestrator import (  # noqa: E402
+    MultiGpuOrchestrator, WorkerState, create_direct_prompt_routing_middleware, synthesize_jobs_payload,
+)
 
 
 class MemoryQueue:
@@ -52,6 +54,37 @@ def result(prompt_id, status="success"):
 
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standard_jobs_import_completed_results_and_retain_them_after_worker_stop(self):
+        orchestrator = self.make_orchestrator()
+        worker = WorkerState(0, 9000, "http://worker", status="healthy")
+        orchestrator.workers = [worker]
+        orchestrator._worker_history = AsyncMock(return_value={"done": result("done")})
+        orchestrator._fetch_worker_json_with_query = AsyncMock(return_value={"jobs": []})
+        queue = orchestrator.prompt_server.prompt_queue
+        app = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+
+        async def native_jobs(request):
+            return web.json_response(synthesize_jobs_payload([], [queue.get_history()], limit=None))
+
+        async def native_detail(request):
+            jobs = synthesize_jobs_payload([], [queue.get_history(request.match_info["job_id"])])["jobs"]
+            return web.json_response(jobs[0] if jobs else {"error": "missing"}, status=200 if jobs else 404)
+
+        app.router.add_get("/api/jobs", native_jobs)
+        app.router.add_get("/api/jobs/{job_id}", native_detail)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get("/api/jobs")
+            jobs = (await response.json())["jobs"]
+            self.assertEqual([job["id"] for job in jobs], ["done"])
+            self.assertEqual(jobs[0]["status"], "completed")
+            self.assertEqual(jobs[0]["outputs_count"], 1)
+            self.assertEqual(queue.history["done"], result("done"))
+            worker.status = "stopped"
+            response = await client.get("/api/jobs/done")
+            self.assertEqual(await response.json(), jobs[0])
+            response = await client.get("/api/jobs")
+            self.assertEqual((await response.json())["jobs"], jobs)
+
     def make_orchestrator(self):
         server = SimpleNamespace(prompt_queue=MemoryQueue(), send=AsyncMock())
         orchestrator = MultiGpuOrchestrator(server)

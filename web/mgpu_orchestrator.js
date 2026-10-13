@@ -68,14 +68,6 @@ function mappedMgpuRoute(route, method) {
     return routeToMgpu(comparable, "/assets", "/mgpu/assets");
   }
 
-  if (method === "GET" && (comparable === "/jobs" || comparable.startsWith("/jobs?"))) {
-    return routeToMgpu(comparable, "/jobs", "/mgpu/jobs");
-  }
-
-  if (method === "GET" && comparable.startsWith("/jobs/")) {
-    return routeToMgpu(comparable, "/jobs", "/mgpu/jobs");
-  }
-
   if (method === "GET" && comparable === "/queue") {
     return "/mgpu/queue";
   }

@@ -64,6 +64,7 @@ FORWARDED_WS_TYPES = {
 }
 DIRECT_HISTORY_PATH = re.compile(r"^/(?:api/)?history(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_PROMPT_PATHS = frozenset({"/prompt", "/api/prompt"})
+DIRECT_JOBS_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs(?:/(?P<prompt_id>[^/]+))?$")
 DIRECT_JOB_CANCEL_PATH = re.compile(r"^/(?:api/)?(?:api/)?jobs/(?:(?P<prompt_id>[^/]+)/)?cancel$")
 _PARENT_WATCHDOG_STARTED = False
 
@@ -1758,10 +1759,81 @@ class MultiGpuOrchestrator:
             )
         )
 
-    async def proxy_job_detail(self, request: Any) -> Any:
+    async def proxy_direct_jobs(self, request: Any, native_handler: Any, prompt_id: str | None = None) -> Any:
+        if not self._started or not self.workers:
+            return await native_handler(request)
+
+        # Keep completed jobs in the primary queue, including after workers stop.
+        await self.sync_history(prompt_id)
+        native_response = await native_handler(request)
+        if prompt_id is not None:
+            if native_response.status != 404 or prompt_id in self._deleted_history_ids:
+                return native_response
+            return await self.proxy_job_detail(request, prompt_id=prompt_id)
+        if native_response.status != 200:
+            return native_response
+
+        query = request.rel_url.query
+        requested_status = parse_status_filter(query.get("status"))
+        active_statuses = [status for status in ("pending", "in_progress")
+                           if requested_status is None or status in requested_status]
+        if not active_statuses:
+            return native_response
+
+        # Validate the original request above, then fetch unpaginated sources so
+        # the merged response has one global sort, page, and accurate total.
+        source_query = query.copy()
+        source_query.popall("limit", None)
+        source_query["offset"] = "0"
+        native_response = await native_handler(request.clone(rel_url=request.rel_url.with_query(source_query)))
+        if native_response.status != 200:
+            return native_response
+        native_payload = json.loads(native_response.body)
+        worker_query = query_to_dict(source_query)
+        worker_query["status"] = ",".join(active_statuses)
+
+        async def active_jobs(worker: WorkerState) -> dict[str, Any]:
+            if worker.status in {"failed", "stopped"}:
+                return {"jobs": []}
+            try:
+                payload = await asyncio.wait_for(
+                    self._fetch_worker_json_with_query(worker, "/api/jobs", worker_query), timeout=5,
+                )
+                if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+                    raise ValueError("invalid worker jobs response")
+            except Exception:
+                # Older workers may lack the jobs API. Fall back per worker so
+                # a mixed-version pool still exposes every active queue.
+                try:
+                    queue = await asyncio.wait_for(self._fetch_worker_json(worker, "/queue"), timeout=5)
+                    payload = synthesize_jobs_payload([queue], [], limit=None)
+                except Exception:
+                    return {"jobs": []}
+            return {"jobs": [job for job in payload["jobs"]
+                             if isinstance(job, dict) and job.get("status") in active_statuses]}
+
+        worker_payloads = await asyncio.gather(*(active_jobs(worker) for worker in self.workers))
+        # Primary history wins if a job completes between the two snapshots.
+        jobs_by_id = {job["id"]: job for job in native_payload["jobs"]}
+        for payload in worker_payloads:
+            for job in payload["jobs"]:
+                if job.get("id") and job["id"] not in self._deleted_history_ids:
+                    jobs_by_id.setdefault(job["id"], job)
+        return web.json_response(aggregate_jobs_payload(
+            [{"jobs": list(jobs_by_id.values())}],
+            status_filter=requested_status,
+            workflow_id=query.get("workflow_id"),
+            sort_by=query.get("sort_by", "created_at").lower(),
+            sort_order=query.get("sort_order", "desc").lower(),
+            limit=parse_positive_int(query.get("limit"), None),
+            offset=parse_offset(query.get("offset")),
+        ))
+
+    async def proxy_job_detail(self, request: Any, prompt_id: str | None = None) -> Any:
         if not self._started:
             return web.json_response({"error": "workers are not started"}, status=424)
-        prompt_id = request.match_info.get("prompt_id", "")
+        if prompt_id is None:
+            prompt_id = request.match_info.get("prompt_id", "")
         preferred = self.prompt_to_worker.get(prompt_id)
         workers = [preferred] if preferred else []
         workers.extend(worker for worker in self.workers if worker is not preferred)
@@ -2236,6 +2308,11 @@ def create_direct_prompt_routing_middleware(orchestrator: MultiGpuOrchestrator) 
             return await orchestrator.proxy_job_cancel(
                 request, prompt_id=cancel_match.group("prompt_id"), no_worker_fallback=handler,
             )
+        jobs_match = DIRECT_JOBS_PATH.fullmatch(request.path) if request.method == "GET" else None
+        if jobs_match is not None:
+            return await orchestrator.proxy_direct_jobs(
+                request, native_handler=handler, prompt_id=jobs_match.group("prompt_id"),
+            )
         return await handler(request)
 
     return route_direct_prompt_request
@@ -2246,10 +2323,10 @@ def install_direct_prompt_routing(prompt_server: Any, orchestrator: MultiGpuOrch
         middleware = create_direct_prompt_routing_middleware(orchestrator)
         prompt_server.app.middlewares.append(middleware)
     except Exception:
-        logging.exception("%s Failed to enable direct prompt, history, and job cancellation API routing", LOG_PREFIX)
+        logging.exception("%s Failed to enable direct prompt, history, and jobs API routing", LOG_PREFIX)
         return False
 
-    logging.info("%s Direct prompt, history, and job cancellation API requests are integrated with workers", LOG_PREFIX)
+    logging.info("%s Direct prompt, history, and jobs API requests are integrated with workers", LOG_PREFIX)
     return True
 
 

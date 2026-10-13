@@ -70,3 +70,12 @@ test("history uses the parent API without browser rewriting", () => {
     assert.equal(routes.mappedMgpuRoute(`${prefix}/history`, "POST"), null);
   }
 });
+
+test("job queries use the parent API without browser rewriting", () => {
+  const routes = loadRoutes("http://localhost:8188");
+  for (const prefix of ["", "/api"]) {
+    for (const route of ["/jobs", "/jobs?status=in_progress&limit=10", "/jobs/prompt-id"]) {
+      assert.equal(routes.mappedMgpuRoute(`${prefix}${route}`, "GET"), null);
+    }
+  }
+});

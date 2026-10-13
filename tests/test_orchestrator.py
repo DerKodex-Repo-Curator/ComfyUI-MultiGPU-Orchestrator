@@ -379,6 +379,133 @@ class FakeResponse:
 
 
 class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standard_jobs_aggregate_primary_and_mixed_worker_apis(self):
+        from contextlib import AsyncExitStack
+
+        async with AsyncExitStack() as stack:
+            orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+            orchestrator._started = True
+            orchestrator.sync_history = AsyncMock()
+            orchestrator.start = AsyncMock()
+            orchestrator._session = await stack.enter_async_context(aiohttp.ClientSession())
+            primary_jobs = [
+                {"id": "completed-primary", "status": "completed", "create_time": 10, "outputs_count": 2},
+                {"id": "local", "status": "in_progress", "create_time": 40, "workflow_id": "wf"},
+            ]
+            worker_jobs = [
+                {"id": "running", "status": "in_progress", "create_time": 30, "workflow_id": "wf"},
+                {"id": "pending", "status": "pending", "create_time": 20, "workflow_id": "wf"},
+                {"id": "completed-primary", "status": "in_progress", "create_time": 10},
+                {"id": "worker-completed", "status": "completed", "create_time": 5},
+            ]
+            modern = web.Application()
+
+            async def jobs(request):
+                self.assertEqual(request.query.get("offset"), "0")
+                self.assertNotIn("limit", request.query)
+                return web.json_response({"jobs": worker_jobs})
+
+            async def detail(request):
+                job = next((job for job in worker_jobs if job["id"] == request.match_info["job_id"]), None)
+                return web.json_response(job or {"error": "missing"}, status=200 if job else 404)
+
+            modern.router.add_get("/api/jobs", jobs)
+            modern.router.add_get("/api/jobs/{job_id}", detail)
+            legacy = web.Application()
+
+            async def queue(request):
+                return web.json_response({
+                    "queue_running": [[0, "legacy", {}, {"create_time": 50, "workflow_id": "wf"}, []]],
+                    "queue_pending": [],
+                })
+
+            legacy.router.add_get("/queue", queue)
+            for index, app in enumerate((modern, legacy)):
+                server = await stack.enter_async_context(TestServer(app))
+                orchestrator.workers.append(WorkerState(
+                    gpu_index=index, port=server.port, url=str(server.make_url("/")).rstrip("/"), status="healthy",
+                ))
+            parent = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+
+            async def native_jobs(request):
+                query = request.query
+                try:
+                    limit = int(query["limit"]) if "limit" in query else None
+                    offset = int(query.get("offset", 0))
+                    if limit is not None and limit <= 0:
+                        raise ValueError()
+                except ValueError:
+                    return web.json_response({"error": "invalid pagination"}, status=400)
+                return web.json_response(aggregate_jobs_payload(
+                    [{"jobs": primary_jobs}], limit=limit, offset=max(offset, 0),
+                    status_filter=query["status"].split(",") if "status" in query else None,
+                    workflow_id=query.get("workflow_id"), sort_order=query.get("sort_order", "desc"),
+                ))
+
+            async def native_detail(request):
+                job = next((job for job in primary_jobs if job["id"] == request.match_info["job_id"]), None)
+                return web.json_response(job or {"error": "missing"}, status=200 if job else 404)
+
+            for prefix in ("", "/api", "/api/api"):
+                parent.router.add_get(f"{prefix}/jobs", native_jobs)
+                parent.router.add_get(f"{prefix}/jobs/{{job_id}}", native_detail)
+            client = await stack.enter_async_context(TestClient(TestServer(parent)))
+            for prefix in ("", "/api", "/api/api"):
+                response = await client.get(f"{prefix}/jobs")
+                self.assertEqual(response.status, 200)
+                payload = await response.json()
+                self.assertEqual([job["id"] for job in payload["jobs"]],
+                                 ["legacy", "local", "running", "pending", "completed-primary"])
+                self.assertEqual(payload["pagination"], {"total": 5, "offset": 0, "limit": None, "has_more": False})
+                self.assertEqual(payload["jobs"][-1], primary_jobs[0])
+                response = await client.get(f"{prefix}/jobs/running")
+                self.assertEqual(await response.json(), worker_jobs[0])
+                response = await client.get(f"{prefix}/jobs/completed-primary")
+                self.assertEqual(await response.json(), primary_jobs[0])
+            response = await client.get("/api/jobs?status=in_progress&workflow_id=wf&sort_order=asc&limit=1&offset=1")
+            payload = await response.json()
+            self.assertEqual([job["id"] for job in payload["jobs"]], ["local"])
+            self.assertEqual(payload["pagination"], {"total": 3, "offset": 1, "limit": 1, "has_more": True})
+            response = await client.get("/api/jobs/legacy")
+            self.assertEqual((await response.json())["status"], "in_progress")
+            response = await client.get("/api/jobs/unknown")
+            self.assertEqual(response.status, 404)
+            response = await client.get("/api/jobs?status=completed")
+            self.assertEqual((await response.json())["jobs"], [primary_jobs[0]])
+            for query in ("limit=0", "limit=bad", "offset=bad"):
+                response = await client.get(f"/api/jobs?{query}")
+                self.assertEqual(response.status, 400)
+            orchestrator._fetch_worker_json_with_query = AsyncMock(side_effect=OSError("offline"))
+            orchestrator._fetch_worker_json = AsyncMock(side_effect=OSError("offline"))
+            response = await client.get("/api/jobs")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(len((await response.json())["jobs"]), 2)
+            # A failed/stopped pool preserves primary results.
+            for worker in orchestrator.workers:
+                worker.status = "stopped"
+            response = await client.get("/api/jobs")
+            self.assertEqual(len((await response.json())["jobs"]), 2)
+            orchestrator.start.assert_not_awaited()
+
+    async def test_standard_jobs_without_workers_or_startup_preserve_native_response(self):
+        orchestrator = MultiGpuOrchestrator(prompt_server=FakePromptServer())
+        orchestrator.sync_history = AsyncMock()
+        app = web.Application(middlewares=[create_direct_prompt_routing_middleware(orchestrator)])
+
+        async def native(request):
+            return web.json_response({"native": request.path}, headers={"X-Native": "kept"})
+
+        app.router.add_get("/api/jobs", native)
+        app.router.add_get("/api/jobs/{job_id}", native)
+        async with TestClient(TestServer(app)) as client:
+            for started, workers in ((False, []), (True, []), (False, [WorkerState(0, 9000, "http://worker")])):
+                orchestrator._started, orchestrator.workers = started, workers
+                for route in ("/api/jobs", "/api/jobs/id"):
+                    response = await client.get(route)
+                    self.assertEqual(await response.json(), {"native": route})
+                    self.assertEqual(response.headers["X-Native"], "kept")
+        orchestrator.sync_history.assert_not_awaited()
+
     async def test_cancel_endpoints_reach_workers_without_browser_rewriting(self):
         from contextlib import AsyncExitStack
 
@@ -477,7 +604,7 @@ class OrchestratorAsyncTests(unittest.IsolatedAsyncioTestCase):
                 request = SimpleNamespace(method="POST", path=f"{prefix}/jobs/{suffix}")
                 self.assertEqual(await middleware(request, native), "cancelled")
                 orchestrator.proxy_job_cancel.assert_awaited_with(request, prompt_id=prompt_id, no_worker_fallback=native)
-        for method, path in (("GET", "/api/jobs/cancel"), ("POST", "/api/jobs/id/retry"), ("POST", "/mgpu/jobs/cancel")):
+        for method, path in (("GET", "/api/jobs/id/retry"), ("POST", "/api/jobs/id/retry"), ("POST", "/mgpu/jobs/cancel")):
             self.assertEqual(await middleware(SimpleNamespace(method=method, path=path), native), "native")
 
     async def test_direct_cancel_without_workers_preserves_native_body(self):

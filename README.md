@@ -45,6 +45,11 @@ including requests without a `client_id` or WebSocket connection. History remain
 available after a worker stops or restarts; clearing or deleting history applies
 to both the main process and workers.
 
+The standard `GET /api/jobs` endpoint includes running and pending worker jobs
+alongside the main process's jobs, with combined filtering, sorting, and pagination.
+`GET /api/jobs/{job_id}` also retrieves worker job details. Completed jobs use the
+main process's synchronized history; job queries need no frontend URL rewriting.
+
 ## Worker Settings
 
 Open the **MultiGPU** sidebar to check worker status and configure:
